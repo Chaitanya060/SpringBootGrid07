@@ -1,86 +1,89 @@
-# SocialAPI — Spring Boot Microservice
+# Social API — Spring Boot Assignment (Grid07)
 
-A high-performance Spring Boot 3.x microservice implementing a social-post backend with Redis-backed virality scoring, atomic concurrency guardrails, and a smart notification batching engine.
+## What I Built
+
+This is a Spring Boot backend for a social media platform where both humans and AI bots can create posts and comments. The main challenge was making sure bots don't go crazy and spam everything — so I built a guardrail system using Redis to control that.
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
-| Language | Java 17 |
-| Framework | Spring Boot 3.x |
-| ORM | Spring Data JPA / Hibernate |
-| Database | PostgreSQL 15 |
-| Cache / State | Redis 7 (Spring Data Redis) |
-| Containerisation | Docker Compose |
+- Java 17
+- Spring Boot 3.5
+- PostgreSQL — stores all the actual data (users, bots, posts, comments)
+- Redis — acts as the gatekeeper for all bot interactions
+- Docker — used to run Redis locally
 
 ---
 
-## Quick Start
+## How to Run This Project
 
+**Step 1 — Start Redis and Postgres using Docker:**
 ```bash
-# 1. Start Postgres + Redis
 docker-compose up -d
+```
 
-# 2. Run the application
+**Step 2 — Update application.properties with your Postgres password**
+
+**Step 3 — Run the Spring Boot app from your IDE or:**
+```bash
 ./mvnw spring-boot:run
 ```
 
-The API is available at `http://localhost:8080`.
+App runs on `http://localhost:8080`
 
 ---
 
 ## API Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/posts` | Create a post (User or Bot author) |
-| POST | `/api/posts/{postId}/comments` | Add a comment; bot guardrails enforced |
-| POST | `/api/posts/{postId}/like` | Like a post (+20 virality) |
+| Method | Endpoint | What it does |
+|--------|----------|--------------|
+| POST | /api/users | Create a user |
+| POST | /api/bots | Create a bot |
+| POST | /api/posts | Create a post |
+| POST | /api/posts/{postId}/comments | Add a comment |
+| POST | /api/posts/{postId}/like | Like a post |
 
-### Sample requests
+---
 
-**Create a post**
-```json
-POST /api/posts
-{
-  "authorId": 1,
-  "authorType": "USER",
-  "content": "Hello world!"
-}
+## Project Structure
+
 ```
-
-**Add a bot comment**
-```json
-POST /api/posts/1/comments
-{
-  "authorId": 1,
-  "authorType": "BOT",
-  "content": "Great post!",
-  "depthLevel": 1
-}
-```
-
-**Like a post**
-```json
-POST /api/posts/1/like
-{
-  "userId": 1
-}
+src/main/java/com/grid07/
+├── controller/      → REST endpoints
+├── model/           → JPA entities (User, Bot, Post, Comment)
+├── repository/      → Database queries
+├── service/         → Business logic
+│   ├── PostService.java
+│   ├── GuardrailService.java
+│   ├── ViralityService.java
+│   └── NotificationService.java
+├── scheduler/       → CRON job for notifications
+├── dto/             → Request body classes
+└── config/          → Redis configuration
 ```
 
 ---
 
-## Phase 2 — Thread Safety: How Atomic Locks Work
+## Phase 2 — How I Handled Thread Safety (The Important Part)
 
-### The Race-Condition Problem
+This was the trickiest part of the assignment. The requirement was that even if 200 bots hit the same post at the exact same millisecond, the bot reply count should stop at exactly 100 — not 101, not 102.
 
-Without atomicity, two concurrent bot requests can both read `bot_count = 99`, both decide the cap hasn't been reached, and both increment to `100` — resulting in `101` comments in the database.
+### The Problem with Normal Approach
 
-### The Solution: Redis Lua Script
+If I just did this in Java:
+```java
+int count = redis.get("post:1:bot_count");  // Thread A reads 99
+// Thread B also reads 99 at the same time!
+if (count < 100) {
+    redis.increment("post:1:bot_count");     // Both A and B increment → becomes 101!
+}
+```
+This would fail because two threads can read the same value before either of them increments it. This is called a **race condition**.
 
-The **Horizontal Cap** (max 100 bot replies per post) is enforced by a single Lua script executed atomically inside Redis:
+### My Solution — Lua Script
+
+I used a **Lua script executed atomically inside Redis**. Redis runs Lua scripts as a single atomic operation — meaning no other command can run in between.
 
 ```lua
 local current = redis.call('GET', KEYS[1])
@@ -94,48 +97,70 @@ else
 end
 ```
 
-Redis executes Lua scripts as a **single, indivisible operation** — no other command can interleave. This means:
+The script does the GET + CHECK + INCR in one atomic step inside Redis. So even if 200 threads call this at the same time, Redis processes them one by one. The 101st request gets -1 back and is rejected with 429 Too Many Requests.
 
-- Thread A reads 99, increments → 100 ✅
-- Thread B arrives at the same nanosecond, reads 100 (already set by A), returns -1 → **rejected** ✅
+This is how I guaranteed the horizontal cap holds exactly at 100 under any concurrent load.
 
-The Spring application calls this script via `StringRedisTemplate.execute(RedisScript<Long>, ...)`.
+### Other Guardrails
 
-### Cooldown Cap
+**Cooldown Cap (10 min per bot-human pair):**
+Used Redis `SETNX` (Set if Not Exists) with a 10-minute TTL:
+```java
+redis.opsForValue().setIfAbsent("cooldown:bot_1:human_1", "1", Duration.ofMinutes(10));
+```
+If key exists → bot is blocked. If not → key is created and interaction is allowed.
 
-Uses `SET key 1 EX 600 NX` (via `setIfAbsent` with a TTL). The NX flag ensures only one thread can "win" the write — subsequent calls return `false` and are rejected.
+**Vertical Cap (max depth 20):**
+Simple check on the `depthLevel` field in the request. No Redis needed here.
 
-### Vertical Cap
+### Order of Checks (Important!)
 
-A pure in-memory check: `depthLevel <= 20`. Redis is not needed because the depth value is supplied by the caller and never changes for a given request.
+I check guardrails in this order:
+1. Vertical cap (cheapest, no Redis)
+2. Cooldown cap (Redis SETNX)
+3. Horizontal cap (Redis Lua script — most expensive, runs last)
 
-### Guardrail Order (fail-fast)
-
-1. **Vertical Cap** — cheapest check, no Redis round-trip
-2. **Horizontal Cap** — atomic Redis Lua script (also increments the counter)
-3. **Cooldown Cap** — atomic Redis SET NX
-
-The database write only happens **after all three guardrails pass**, ensuring no phantom rows appear in PostgreSQL when a guardrail rejects the request.
+This way if a bot fails the cooldown check, we never waste a bot_count slot by incrementing it unnecessarily.
 
 ---
 
-## Phase 3 — Notification Engine
+## Phase 3 — Notification System
 
-- **Throttler**: First bot interaction within a 15-minute window logs `"Push Notification Sent to User"` and sets a 15-min TTL key. Subsequent interactions during that window are queued in a Redis List (`user:{id}:pending_notifs`).
-- **CRON Sweeper**: `@Scheduled(fixedRate = 300_000)` (every 5 min) scans all pending lists, pops messages atomically, and logs a summarised message: `"Summarized Push Notification: Bot X and [N] others interacted with your posts."`
+When a bot interacts with a user's post:
+- If user hasn't been notified in last 15 min → send immediately + set 15 min cooldown key
+- If user was already notified recently → push to a Redis List (`user:{id}:pending_notifs`)
+
+A `@Scheduled` CRON job runs every 5 minutes, scans all pending notification lists, pops all messages, logs a summarized notification like:
+```
+Summarized Push Notification: BotAlpha and [3] others interacted with your posts.
+```
 
 ---
 
 ## Statelessness
 
-All mutable state lives exclusively in Redis:
+Everything is stored in Redis — no HashMaps, no static variables anywhere in the Java code. The Spring Boot app is completely stateless and could run on multiple instances without any issues.
 
-| State | Redis Key |
-|---|---|
-| Virality score | `post:{id}:virality_score` |
-| Bot reply count | `post:{id}:bot_count` |
-| Bot-human cooldown | `cooldown:bot_{botId}:human_{humanId}` |
-| Notification cooldown | `notif_cooldown:user:{userId}` |
-| Pending notifications | `user:{userId}:pending_notifs` |
+---
 
-No `HashMap`, no `static` fields, no in-process caches.
+## Sample Postman Requests
+
+**Create User:**
+```json
+POST /api/users
+{
+  "username": "chaitanya",
+  "isPremium": true
+}
+```
+
+**Add Bot Comment:**
+```json
+POST /api/posts/1/comments
+{
+  "authorId": 1,
+  "authorType": "BOT",
+  "content": "Nice post!",
+  "depthLevel": 1
+}
+```
